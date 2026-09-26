@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { parquetMetadataAsync, parquetScan } from '../src/index.js'
+import { parquetMetadataAsync, parquetRead, parquetReadObjects, parquetScan } from '../src/index.js'
 import { asyncBufferFromFile } from '../src/node.js'
+import { prefetchPageIndexes } from '../src/plan.js'
 import { parquetReadColumn } from '../src/read.js'
 import { countingBuffer } from './helpers.js'
 
@@ -141,6 +142,53 @@ describe('parquetScan', () => {
     expect(content[0]).toMatch(/^brown data sit fox/)
     expect(counted.fetches).toBe(2) // offset index and selected page
     expect(counted.bytes).toBe(892)
+  })
+
+  it('reads only selected pages for a column view', async () => {
+    const file = await asyncBufferFromFile('test/files/offset_indexed.parquet')
+    const metadata = await parquetMetadataAsync(file)
+    const counted = countingBuffer(file)
+    const scan = await parquetScan({ file: counted, metadata, columns: ['content'] })
+    const view = await scan.readColumnView({ column: 'content', rowStart: 97, rowEnd: 98 })
+
+    expect(view.toArray()).toHaveLength(1)
+    expect(view.get(0)).toMatch(/^brown data sit fox/)
+    expect(view.leaves[0].rowStart).toBeLessThanOrEqual(97)
+    expect(counted.fetches).toBe(2)
+    expect(counted.bytes).toBe(892)
+  })
+
+  it('aligns nested leaves with different offset-index page boundaries', async () => {
+    const file = await asyncBufferFromFile('test/files/struct_offset_index.parquet')
+    const scan = await parquetScan({ file, columns: ['messages'] })
+    const view = await scan.readColumnView({ column: 'messages', rowStart: 15, rowEnd: 18 })
+    const rows = await parquetReadObjects({ file, columns: ['messages'], rowStart: 15, rowEnd: 18 })
+
+    expect(view.toArray()).toEqual(rows.map(row => row.messages))
+    for (let i = 0; i < view.length; i++) expect(view.get(i)).toEqual(rows[i].messages)
+  })
+
+  it('uses supplied page ranges and locations in parquetRead column views', async () => {
+    const file = await asyncBufferFromFile('test/files/page_index.parquet')
+    const metadata = await parquetMetadataAsync(file)
+    const { pageRangesByGroup, pageLocationsByGroup } = await prefetchPageIndexes({
+      file, metadata, filter: { id: { $in: [100, 1400] } }, columns: ['word'],
+    })
+    pageRangesByGroup[1] = []
+    const counted = countingBuffer(file)
+    /** @type {{columnName: string, view: import('../src/types.js').ParquetColumnView}[]} */
+    const results = []
+    await parquetRead({
+      file: counted, metadata, columns: ['word'], pageRangesByGroup, pageLocationsByGroup,
+      onColumnView: result => results.push(result),
+    })
+
+    expect(results).toHaveLength(2)
+    expect(results.map(result => result.columnName)).toEqual(['word', 'word'])
+    expect(results[0].view.get(100 - results[0].view.rowStart)).toBe('word-000100')
+    expect(results[1].view.get(1400 - results[1].view.rowStart)).toBe('word-001400')
+    const fullChunk = Number(metadata.row_groups[0].columns[1].meta_data?.total_compressed_size)
+    expect(counted.bytes).toBeLessThan(fullChunk)
   })
 
   it('uses row-group statistics for candidate-range pruning', async () => {

@@ -12,7 +12,7 @@ import { flatten } from './utils.js'
  * assembled only when requested by get() or toArray().
  *
  * @param {SchemaTree} schema top-level selected column
- * @param {{pathInSchema: string[], schemaPath: SchemaTree[], pages: ColumnLevelPage[]}[]} decodedLeaves
+ * @param {{pathInSchema: string[], schemaPath: SchemaTree[], pages: ColumnLevelPage[], rowStart: number}[]} decodedLeaves
  * @param {number} groupStart absolute first row of the row group
  * @param {number} groupRows number of rows in the row group
  * @param {number} rowStart absolute first requested row
@@ -21,9 +21,11 @@ import { flatten } from './utils.js'
  * @returns {ParquetColumnView}
  */
 export function createColumnView(schema, decodedLeaves, groupStart, groupRows, rowStart, rowEnd, parsers) {
-  const leaves = decodedLeaves.map(leaf => indexLeaf(leaf, groupRows))
+  if (rowStart < groupStart || rowEnd > groupStart + groupRows) {
+    throw new RangeError('parquet column view selection is outside the row group')
+  }
+  const leaves = decodedLeaves.map(leaf => indexLeaf(leaf, rowStart, rowEnd))
   const allParsers = { ...DEFAULT_PARSERS, ...parsers }
-  const baseRow = rowStart - groupStart
   const length = rowEnd - rowStart
 
   /**
@@ -34,13 +36,13 @@ export function createColumnView(schema, decodedLeaves, groupStart, groupRows, r
     if (!Number.isSafeInteger(index) || index < 0 || index >= length) {
       throw new RangeError('parquet column view index out of range')
     }
-    const row = baseRow + index
-    if (!schema.children.length) return materializeLeafRow(leaves[0], row)[0]
+    const row = rowStart + index
+    if (!schema.children.length) return materializeLeafRow(leaves[0], row - leaves[0].rowStart)[0]
 
     /** @type {Map<string, DecodedArray>} */
     const subcolumnData = new Map()
     for (const leaf of leaves) {
-      subcolumnData.set(leaf.pathInSchema.join('.'), materializeLeafRow(leaf, row))
+      subcolumnData.set(leaf.pathInSchema.join('.'), materializeLeafRow(leaf, row - leaf.rowStart))
     }
     assembleNested(subcolumnData, schema, allParsers)
     const assembled = subcolumnData.get(schema.path.join('.'))
@@ -67,8 +69,9 @@ export function createColumnView(schema, decodedLeaves, groupStart, groupRows, r
         previous = assembled
       }
       const complete = flatten(chunks)
-      const selected = baseRow === 0 && length === complete.length
-        ? complete : complete.slice(baseRow, baseRow + length)
+      const start = rowStart - leaf.rowStart
+      const selected = start === 0 && length === complete.length
+        ? complete : complete.slice(start, start + length)
       subcolumnData.set(leaf.pathInSchema.join('.'), selected)
     }
     if (!schema.children.length) {
@@ -86,13 +89,33 @@ export function createColumnView(schema, decodedLeaves, groupStart, groupRows, r
 }
 
 /**
- * @param {{pathInSchema: string[], schemaPath: SchemaTree[], pages: ColumnLevelPage[]}} leaf
- * @param {number} expectedRows
+ * @param {{pathInSchema: string[], schemaPath: SchemaTree[], pages: ColumnLevelPage[], rowStart: number}} leaf
+ * @param {number} selectedStart
+ * @param {number} selectedEnd
  * @returns {ParquetColumnLeaf & { maxDefinitionLevel: number }}
  */
-function indexLeaf(leaf, expectedRows) {
+function indexLeaf(leaf, selectedStart, selectedEnd) {
   const maxDefinitionLevel = getMaxDefinitionLevel(leaf.schemaPath)
   const maxRepetitionLevel = getMaxRepetitionLevel(leaf.schemaPath)
+  let firstEvent = true
+  const expectedRows = leaf.pages.reduce((count, page) => {
+    const events = page.repetitionLevels.length || page.definitionLevels.length || page.values.length
+    if (maxRepetitionLevel && events && !page.repetitionLevels.length) {
+      throw new Error('parquet column view missing repetition levels')
+    }
+    if (!page.repetitionLevels.length) {
+      if (events) firstEvent = false
+      return count + events
+    }
+    for (const level of page.repetitionLevels) {
+      if (firstEvent || level === 0) count++
+      firstEvent = false
+    }
+    return count
+  }, 0)
+  if (leaf.rowStart > selectedStart || leaf.rowStart + expectedRows < selectedEnd) {
+    throw new Error('parquet column view selected pages do not cover requested rows')
+  }
   const rowOffsets = new Uint32Array(expectedRows + 1)
   const valueOffsets = new Uint32Array(expectedRows + 1)
   let eventCount = 0
@@ -102,9 +125,6 @@ function indexLeaf(leaf, expectedRows) {
     const eventStart = eventCount
     const valueStart = valueCount
     const count = page.repetitionLevels.length || page.definitionLevels.length || page.values.length
-    if (maxRepetitionLevel && count && !page.repetitionLevels.length) {
-      throw new Error('parquet column view missing repetition levels')
-    }
     for (let i = 0; i < count; i++) {
       if (!eventCount || !page.repetitionLevels.length || page.repetitionLevels[i] === 0) {
         if (rowCount >= expectedRows) throw new Error('parquet column view row count exceeds metadata')
@@ -119,12 +139,10 @@ function indexLeaf(leaf, expectedRows) {
   })
   rowOffsets[rowCount] = eventCount
   valueOffsets[rowCount] = valueCount
-  if (rowCount !== expectedRows) {
-    throw new Error(`parquet column view row count mismatch: ${rowCount} != ${expectedRows}`)
-  }
   return {
     pathInSchema: leaf.pathInSchema,
     schemaPath: leaf.schemaPath,
+    rowStart: leaf.rowStart,
     maxDefinitionLevel,
     pages,
     rowOffsets,
