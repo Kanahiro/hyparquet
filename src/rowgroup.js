@@ -147,9 +147,9 @@ async function readSelectedPages(options, groupPlan, chunk, pages, columnDecoder
 
 /**
  * Fetch a selected run of data pages, including a dictionary page when needed.
- * For repeated leaves, adjacent pages can share a row. Include the preceding
- * page and any earlier pages with the same first-row index to retain the
- * beginning of the selected row.
+ * For repeated leaves, adjacent pages with the same first-row index can
+ * share a row. Include only those earlier pages; a preceding page with a
+ * different first-row index must not add I/O to a sparse read.
  *
  * @param {ParquetReadOptions} options
  * @param {GroupPlan} groupPlan
@@ -187,7 +187,6 @@ async function fetchSelectedPages(options, groupPlan, chunk, pages, includeConti
     while (firstPage > 0 && Number(pages[firstPage - 1].first_row_index) === skipped) {
       firstPage--
     }
-    if (firstPage > 0) firstPage--
     startByte = Number(pages[firstPage].offset)
     skipped = Number(pages[firstPage].first_row_index)
   }
