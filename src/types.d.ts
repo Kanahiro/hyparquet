@@ -39,7 +39,6 @@ export interface BaseParquetReadOptions {
   rowEnd?: number // last requested row index (exclusive)
   onChunk?: (chunk: ColumnData) => void // called when a column chunk is parsed. chunks may contain data outside the requested range.
   onPage?: (chunk: SubColumnData) => void // called when a data page is parsed. pages may contain data outside the requested range.
-  onColumnView?: (result: { columnName: string, view: ParquetColumnView }) => void // one view per selected column and planned row range; defaults to using offset indexes
   pageRangesByGroup?: (PageRanges | undefined)[] // candidate row ranges per row group, relative to each group
   pageLocationsByGroup?: Record<string, PageLocation[]>[] // offset-index locations keyed by physical leaf path
   compressors?: Compressors // custom decompressors
@@ -64,8 +63,17 @@ interface ObjectRowFormat {
 }
 export type ParquetReadOptions = BaseParquetReadOptions & (ArrayRowFormat | ObjectRowFormat)
 
+/** Read selected pages as lazy column views. `filter` prunes candidates but does not filter individual rows. */
+export type ParquetColumnViewReadOptions = Omit<BaseParquetReadOptions,
+  'onChunk' | 'onPage' | 'includeRowIndex' | 'filterStrict' | 'filter'> & {
+  /** One view per selected top-level column and planned row range. */
+  onColumnView: (result: { columnName: string, view: ParquetColumnView }) => void
+  /** Conservative predicate for row-group/page pruning; not applied to emitted views. */
+  filter?: ParquetQueryFilter
+}
+
 /** Options for a lazy, column-oriented parquet scan. */
-export type ParquetScanOptions = Omit<BaseParquetReadOptions, 'filter' | 'onChunk' | 'onPage' | 'onColumnView' | 'useOffsetIndex' | 'includeRowIndex'> & {
+export type ParquetScanOptions = Omit<BaseParquetReadOptions, 'filter' | 'onChunk' | 'onPage' | 'useOffsetIndex' | 'includeRowIndex'> & {
   /** Conservative filter used only to prune physical row ranges. */
   pruningFilter?: ParquetQueryFilter
   /** Use offset indexes for range reads when available (default true). */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parquetMetadataAsync, parquetRead, parquetReadObjects, parquetScan } from '../src/index.js'
+import { parquetMetadataAsync, parquetRead, parquetReadColumnViews, parquetReadObjects, parquetScan } from '../src/index.js'
 import { asyncBufferFromFile } from '../src/node.js'
 import { prefetchPageIndexes } from '../src/plan.js'
 import { parquetReadColumn } from '../src/read.js'
@@ -183,7 +183,7 @@ describe('parquetScan', () => {
     expect(counted.bytes).toBeLessThan(fullBytes)
   })
 
-  it('uses supplied page ranges and locations in parquetRead column views', async () => {
+  it('uses supplied page ranges and locations in parquetReadColumnViews', async () => {
     const file = await asyncBufferFromFile('test/files/page_index.parquet')
     const metadata = await parquetMetadataAsync(file)
     const { pageRangesByGroup, pageLocationsByGroup } = await prefetchPageIndexes({
@@ -193,7 +193,7 @@ describe('parquetScan', () => {
     const counted = countingBuffer(file)
     /** @type {{columnName: string, view: import('../src/types.js').ParquetColumnView}[]} */
     const results = []
-    await parquetRead({
+    await parquetReadColumnViews({
       file: counted, metadata, columns: ['word'], pageRangesByGroup, pageLocationsByGroup,
       onColumnView: result => results.push(result),
     })
@@ -204,6 +204,32 @@ describe('parquetScan', () => {
     expect(results[1].view.get(1400 - results[1].view.rowStart)).toBe('word-001400')
     const fullChunk = Number(metadata.row_groups[0].columns[1].meta_data?.total_compressed_size)
     expect(counted.bytes).toBeLessThan(fullChunk)
+  })
+
+  it('points former onColumnView callers to the separate function', async () => {
+    const file = await asyncBufferFromFile('test/files/page_index.parquet')
+    await expect(parquetRead({ file, onColumnView() {} }))
+      .rejects.toThrow('parquet onColumnView moved to parquetReadColumnViews')
+  })
+
+  it('treats a column-view filter as page pruning without exact row filtering', async () => {
+    const file = await asyncBufferFromFile('test/files/page_index.parquet')
+    /** @type {{columnName: string, view: import('../src/types.js').ParquetColumnView}[]} */
+    const results = []
+    await parquetReadColumnViews({
+      file, columns: ['word'], filter: { id: { $eq: 1234 } }, usePageIndex: true,
+      onColumnView: result => results.push(result),
+    })
+
+    expect(new Set(results.map(result => result.columnName))).toEqual(new Set(['id', 'word']))
+    const idView = results.find(result => result.columnName === 'id')?.view
+    const wordView = results.find(result => result.columnName === 'word')?.view
+    expect(idView).toBeDefined()
+    expect(wordView).toBeDefined()
+    if (!idView || !wordView) return
+    expect(idView.length).toBeGreaterThan(1)
+    expect(idView.get(1234 - idView.rowStart)).toBe(1234)
+    expect(wordView.get(1234 - wordView.rowStart)).toBe('word-001234')
   })
 
   it('uses row-group statistics for candidate-range pruning', async () => {

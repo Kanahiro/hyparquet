@@ -3,10 +3,10 @@
  */
 
 import { assembleNested } from './assemble.js'
-import { readColumn, readColumnPages } from './column.js'
+import { readColumn } from './column.js'
 import { DEFAULT_PARSERS } from './convert.js'
 import { readOffsetIndex } from './indexes.js'
-import { getMaxRepetitionLevel, getSchemaPath } from './schema.js'
+import { getSchemaPath } from './schema.js'
 import { flatten } from './utils.js'
 
 /**
@@ -23,7 +23,17 @@ export function readRowGroup(options, { metadata }, groupPlan) {
 
   // read column data
   for (const chunk of groupPlan.chunks) {
-    const { pathInSchema, columnDecoder } = decoderForChunk(options, metadata, chunk)
+    const { path_in_schema: pathInSchema } = chunk.columnMetadata
+    const schemaPath = getSchemaPath(metadata.schema, pathInSchema)
+    const columnDecoder = {
+      pathInSchema,
+      element: schemaPath[schemaPath.length - 1].element,
+      schemaPath,
+      ...options,
+      ...chunk.columnMetadata,
+      // merge after options, so a partial parsers object keeps the defaults
+      parsers: { ...DEFAULT_PARSERS, ...options.parsers },
+    }
     const { startByte, endByte } = chunk.range
 
     if ('pageLocations' in chunk) {
@@ -65,63 +75,6 @@ export function readRowGroup(options, { metadata }, groupPlan) {
 }
 
 /**
- * Read physical leaf pages for a column view. The view indexes
- * Dremel row boundaries before materializing any nested JavaScript values.
- *
- * @param {ParquetReadOptions} options
- * @param {QueryPlan} plan
- * @param {GroupPlan} groupPlan
- * @returns {{pathInSchema: string[], schemaPath: SchemaTree[], pages: Promise<{pages: import('../src/types.js').ColumnLevelPage[], rowStart: number}>}[]}
- */
-export function readRowGroupPages(options, { metadata }, groupPlan) {
-  return groupPlan.chunks.map(chunk => {
-    const { pathInSchema, schemaPath, columnDecoder } = decoderForChunk(options, metadata, chunk)
-    const { startByte, endByte } = chunk.range
-    /** @returns {Promise<{pages: import('../src/types.js').ColumnLevelPage[], rowStart: number}>} */
-    async function selectedPages() {
-      const locations = 'pageLocations' in chunk ? chunk.pageLocations :
-        'offsetIndex' in chunk ? readOffsetIndex({
-          view: new DataView(await options.file.slice(chunk.offsetIndex.startByte, chunk.offsetIndex.endByte)),
-          offset: 0,
-        }).page_locations : undefined
-      if (locations) {
-        const repeated = getMaxRepetitionLevel(schemaPath) > 0
-        const { view, skipped } = await fetchSelectedPages(options, groupPlan, chunk, locations, repeated)
-        return { pages: readColumnPages({ view, offset: 0 }, columnDecoder), rowStart: groupPlan.groupStart + skipped }
-      }
-      const view = new DataView(await options.file.slice(startByte, endByte))
-      return { pages: readColumnPages({ view, offset: 0 }, columnDecoder), rowStart: groupPlan.groupStart }
-    }
-    return {
-      pathInSchema,
-      schemaPath,
-      pages: selectedPages(),
-    }
-  })
-}
-
-/**
- * @param {ParquetReadOptions} options
- * @param {QueryPlan['metadata']} metadata
- * @param {ChunkPlan} chunk
- * @returns {{pathInSchema: string[], schemaPath: SchemaTree[], columnDecoder: ColumnDecoder}}
- */
-function decoderForChunk(options, metadata, chunk) {
-  const { path_in_schema: pathInSchema } = chunk.columnMetadata
-  const schemaPath = getSchemaPath(metadata.schema, pathInSchema)
-  const columnDecoder = {
-    pathInSchema,
-    element: schemaPath[schemaPath.length - 1].element,
-    schemaPath,
-    ...options,
-    ...chunk.columnMetadata,
-    // merge after options, so a partial parsers object keeps the defaults
-    parsers: { ...DEFAULT_PARSERS, ...options.parsers },
-  }
-  return { pathInSchema, schemaPath, columnDecoder }
-}
-
-/**
  * Read only the pages of a column chunk that overlap the group plan's select
  * range [selectStart, selectEnd), using page locations from the offset index.
  *
@@ -133,39 +86,12 @@ function decoderForChunk(options, metadata, chunk) {
  * @returns {Promise<{data: DecodedArray[], skipped: number}>}
  */
 async function readSelectedPages(options, groupPlan, chunk, pages, columnDecoder) {
-  const { view, skipped } = await fetchSelectedPages(options, groupPlan, chunk, pages)
-  const reader = { view, offset: 0 }
-  const adjustedGroupPlan = skipped ? {
-    ...groupPlan,
-    groupStart: groupPlan.groupStart + skipped,
-    selectStart: groupPlan.selectStart - skipped,
-    selectEnd: groupPlan.selectEnd - skipped,
-  } : groupPlan
-  const { data, skipped: columnSkipped } = readColumn(reader, adjustedGroupPlan, columnDecoder, options.onPage)
-  return { data, skipped: skipped + columnSkipped }
-}
-
-/**
- * Fetch a selected run of data pages, including a dictionary page when needed.
- * For repeated leaves, adjacent pages with the same first-row index can
- * share a row. Include only those earlier pages; a preceding page with a
- * different first-row index must not add I/O to a sparse read.
- *
- * @param {ParquetReadOptions} options
- * @param {GroupPlan} groupPlan
- * @param {ChunkPlan} chunk
- * @param {PageLocation[]} pages
- * @param {boolean} [includeContinuedRow]
- * @returns {Promise<{view: DataView, skipped: number}>}
- */
-async function fetchSelectedPages(options, groupPlan, chunk, pages, includeContinuedRow = false) {
   const { data_page_offset, dictionary_page_offset } = chunk.columnMetadata
   const { selectStart, selectEnd } = groupPlan
   let { startByte, endByte } = chunk.range
   let skipped = -1
-  let firstPage = -1
   // include dictionary if present, handle polars missing dictionary_page_offset
-  const hasDict = pages.length > 0 && (dictionary_page_offset || data_page_offset < pages[0].offset)
+  const hasDict = dictionary_page_offset || data_page_offset < pages[0].offset
   for (let i = 0; i < pages.length; i++) {
     const page = pages[i]
     const pageStart = Number(page.first_row_index)
@@ -176,20 +102,12 @@ async function fetchSelectedPages(options, groupPlan, chunk, pages, includeConti
     if (skipped < 0 && pageEnd > selectStart) {
       startByte = Number(page.offset)
       skipped = pageStart
-      firstPage = i
     }
     if (pageStart < selectEnd) {
       endByte = Number(page.offset) + page.compressed_page_size
     }
   }
   if (skipped < 0) skipped = 0
-  if (includeContinuedRow && firstPage > 0) {
-    while (firstPage > 0 && Number(pages[firstPage - 1].first_row_index) === skipped) {
-      firstPage--
-    }
-    startByte = Number(pages[firstPage].offset)
-    skipped = Number(pages[firstPage].first_row_index)
-  }
   /** @type {DataView} */
   let view
   if (hasDict && skipped) {
@@ -211,7 +129,19 @@ async function fetchSelectedPages(options, groupPlan, chunk, pages, includeConti
   } else {
     view = new DataView(await options.file.slice(startByte, endByte))
   }
-  return { view, skipped }
+  const reader = { view, offset: 0 }
+  // adjust row selection for skipped pages
+  const adjustedGroupPlan = skipped ? {
+    ...groupPlan,
+    groupStart: groupPlan.groupStart + skipped,
+    selectStart: groupPlan.selectStart - skipped,
+    selectEnd: groupPlan.selectEnd - skipped,
+  } : groupPlan
+  const { data, skipped: columnSkipped } = readColumn(reader, adjustedGroupPlan, columnDecoder, options.onPage)
+  return {
+    data,
+    skipped: skipped + columnSkipped,
+  }
 }
 
 /**

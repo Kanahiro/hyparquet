@@ -1,5 +1,5 @@
 /**
- * @import {AsyncRowGroup, BaseParquetReadOptions, DecodedArray, ParquetReadOptions, ParquetRow} from '../src/types.js'
+ * @import {AsyncRowGroup, BaseParquetReadOptions, DecodedArray, ParquetColumnViewReadOptions, ParquetReadOptions, ParquetRow} from '../src/types.js'
  */
 
 import { columnsNeededForFilter, matchFilter } from './filter.js'
@@ -29,6 +29,9 @@ export const rowIndex = /** @type {typeof import('../src/types.js').rowIndex} */
  * @returns {Promise<void>} resolves when all requested rows and columns are parsed, all errors are thrown here
  */
 export async function parquetRead(options) {
+  if ('onColumnView' in options && options.onColumnView) {
+    throw new Error('parquet onColumnView moved to parquetReadColumnViews')
+  }
   // load metadata if not provided
   options.metadata ??= await parquetMetadataAsync(options.file, options)
 
@@ -50,19 +53,10 @@ export async function parquetRead(options) {
     const extraColumns = filterColumns.filter(column => !selectedColumns.has(column))
     if (extraColumns.length) readColumns = [...columns, ...extraColumns]
   }
-  const viewOptions = options.onColumnView && options.useOffsetIndex === undefined
-    ? { ...options, useOffsetIndex: true } : options
-  const readOptions = readColumns === columns ? viewOptions : { ...viewOptions, columns: readColumns }
+  const readOptions = readColumns === columns ? options : { ...options, columns: readColumns }
   const prepared = await prepareParquetRead(readOptions)
   const preparedOptions = prepared.options
   const requiresProjection = readColumns !== columns
-  if (options.onColumnView) {
-    if (onChunk || onComplete || options.onPage) {
-      throw new Error('parquet onColumnView cannot be combined with onChunk, onComplete, or onPage')
-    }
-    await readParquetColumnViews(preparedOptions, prepared.plan, options.onColumnView)
-    return
-  }
   const asyncGroups = readParquetPlan(preparedOptions, prepared.plan)
 
   // skip assembly if no onComplete or onChunk, but wait for reading to finish
@@ -145,6 +139,32 @@ export async function parquetRead(options) {
     // wait for all async groups to finish (complete takes care of this)
     await awaitAllColumns(assembled)
   }
+}
+
+/**
+ * Read selected physical leaf pages and expose lazy column views. A filter
+ * prunes candidate pages; callers apply exact predicates to the resulting
+ * values when needed.
+ *
+ * @param {ParquetColumnViewReadOptions} options
+ * @returns {Promise<void>}
+ */
+export async function parquetReadColumnViews({ onColumnView, ...options }) {
+  if (!onColumnView) throw new Error('parquet onColumnView callback is required')
+  const { columns, filter } = options
+  const filterColumns = columnsNeededForFilter(filter)
+  let readColumns = columns
+  if (columns && filterColumns.length) {
+    const selectedColumns = new Set(columns)
+    const extraColumns = filterColumns.filter(column => !selectedColumns.has(column))
+    if (extraColumns.length) readColumns = [...columns, ...extraColumns]
+  }
+  const prepared = await prepareParquetRead({
+    ...options,
+    columns: readColumns,
+    useOffsetIndex: options.useOffsetIndex ?? true,
+  })
+  await readParquetColumnViews(prepared.options, prepared.plan, onColumnView)
 }
 
 /**

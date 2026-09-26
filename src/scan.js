@@ -13,9 +13,10 @@
 
 import { columnsNeededForFilter } from './filter.js'
 import { createColumnView } from './columnview.js'
+import { readRowGroupPages } from './columnviewpages.js'
 import { parquetMetadataAsync, parquetSchema } from './metadata.js'
 import { parquetPlan, parquetPlanGroup, parquetPlanGroups, prefetchAsyncBuffer, prefetchBloomFilters, prefetchPageIndexes } from './plan.js'
-import { assembleAsync, readRowGroup, readRowGroupPages } from './rowgroup.js'
+import { assembleAsync, readRowGroup } from './rowgroup.js'
 import { flatten } from './utils.js'
 
 /**

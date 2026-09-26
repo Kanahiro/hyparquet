@@ -227,10 +227,12 @@ console.log(view.toArray()) // assemble all selected rows
 
 `rowOffsets` and `valueOffsets` on each leaf are indexed from `leaf.rowStart`, the first row covered by that leaf's decoded pages. Different leaves of a struct may start at different page boundaries. Values have already passed through the configured logical type parsers and dictionary decoding. When an offset index is available, `readColumnView()` reads only pages that cover the requested rows, plus a dictionary page when needed. It includes earlier pages only when they share the selected page's `first_row_index`. Without an offset index, it reads the complete column chunk.
 
-`parquetRead()` also accepts `onColumnView` for callers that already provide `pageRangesByGroup` and `pageLocationsByGroup`. It emits one view per selected top-level column and planned row range, without assembling lists or structs. The callback is exclusive with `onChunk`, `onPage`, and `onComplete`.
+`parquetReadColumnViews()` accepts `pageRangesByGroup` and `pageLocationsByGroup` for callers with an existing page plan. It emits one view per selected top-level column and planned row range, without assembling lists or structs. Its `filter` option only prunes candidate pages; callers apply exact row predicates themselves. Callbacks run after all planned reads finish.
 
 ```javascript
-await parquetRead({
+import { parquetReadColumnViews } from 'hyparquet'
+
+await parquetReadColumnViews({
   file, metadata, columns: ['items'],
   pageRangesByGroup, pageLocationsByGroup,
   onColumnView({ columnName, view }) {
