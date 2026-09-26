@@ -168,6 +168,21 @@ describe('parquetScan', () => {
     for (let i = 0; i < view.length; i++) expect(view.get(i)).toEqual(rows[i].messages)
   })
 
+  it('does not fetch the preceding page for a repeated leaf with a new first row', async () => {
+    const file = await asyncBufferFromFile('test/files/struct_offset_index.parquet')
+    const metadata = await parquetMetadataAsync(file)
+    const counted = countingBuffer(file)
+    const scan = await parquetScan({ file: counted, metadata, columns: ['messages'] })
+    const view = await scan.readColumnView({ column: 'messages', rowStart: 19, rowEnd: 20 })
+    const rows = await parquetReadObjects({ file, metadata, columns: ['messages'], rowStart: 19, rowEnd: 20 })
+
+    expect(view.toArray()).toEqual(rows.map(row => row.messages))
+    expect(view.get(0)).toEqual(rows[0].messages)
+    const fullBytes = metadata.row_groups[0].columns.reduce((sum, chunk) =>
+      sum + Number(chunk.meta_data?.total_compressed_size) + (chunk.offset_index_length || 0), 0)
+    expect(counted.bytes).toBeLessThan(fullBytes)
+  })
+
   it('uses supplied page ranges and locations in parquetRead column views', async () => {
     const file = await asyncBufferFromFile('test/files/page_index.parquet')
     const metadata = await parquetMetadataAsync(file)
