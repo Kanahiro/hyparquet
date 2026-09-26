@@ -225,7 +225,22 @@ console.log(view.get(0))   // assemble only the first selected row
 console.log(view.toArray()) // assemble all selected rows
 ```
 
-`rowOffsets` and `valueOffsets` on each leaf are indexed from `view.groupStart`, the first row of the backing row group. Values have already passed through the configured logical type parsers and dictionary decoding. The current implementation reads complete column chunks for a view, so a small row range can transfer more bytes than `readColumn()` with an offset index.
+`rowOffsets` and `valueOffsets` on each leaf are indexed from `leaf.rowStart`, the first row covered by that leaf's decoded pages. Different leaves of a struct may start at different page boundaries. Values have already passed through the configured logical type parsers and dictionary decoding. When an offset index is available, `readColumnView()` reads only pages that cover the requested rows, plus a dictionary page and any preceding fragment of a continued row. Without an offset index, it reads the complete column chunk.
+
+`parquetRead()` also accepts `onColumnView` for callers that already provide `pageRangesByGroup` and `pageLocationsByGroup`. It emits one view per selected top-level column and planned row range, without assembling lists or structs. The callback is exclusive with `onChunk`, `onPage`, and `onComplete`.
+
+```javascript
+await parquetRead({
+  file, metadata, columns: ['items'],
+  pageRangesByGroup, pageLocationsByGroup,
+  onColumnView({ columnName, view }) {
+    for (const leaf of view.leaves) {
+      // Pass compact values and row offsets to a column-oriented consumer.
+      consume(columnName, leaf.pathInSchema, leaf.pages, leaf.rowOffsets)
+    }
+  },
+})
+```
 
 ### Binary columns
 

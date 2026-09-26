@@ -6,7 +6,7 @@ import { columnsNeededForFilter, matchFilter } from './filter.js'
 import { parquetMetadataAsync, parquetSchema } from './metadata.js'
 import { parquetPlan } from './plan.js'
 import { assembleAsync, asyncGroupToRows } from './rowgroup.js'
-import { prepareParquetRead, readParquetPlan } from './scan.js'
+import { prepareParquetRead, readParquetColumnViews, readParquetPlan } from './scan.js'
 import { concat } from './utils.js'
 
 /**
@@ -50,10 +50,19 @@ export async function parquetRead(options) {
     const extraColumns = filterColumns.filter(column => !selectedColumns.has(column))
     if (extraColumns.length) readColumns = [...columns, ...extraColumns]
   }
-  const readOptions = readColumns === columns ? options : { ...options, columns: readColumns }
+  const viewOptions = options.onColumnView && options.useOffsetIndex === undefined
+    ? { ...options, useOffsetIndex: true } : options
+  const readOptions = readColumns === columns ? viewOptions : { ...viewOptions, columns: readColumns }
   const prepared = await prepareParquetRead(readOptions)
   const preparedOptions = prepared.options
   const requiresProjection = readColumns !== columns
+  if (options.onColumnView) {
+    if (onChunk || onComplete || options.onPage) {
+      throw new Error('parquet onColumnView cannot be combined with onChunk, onComplete, or onPage')
+    }
+    await readParquetColumnViews(preparedOptions, prepared.plan, options.onColumnView)
+    return
+  }
   const asyncGroups = readParquetPlan(preparedOptions, prepared.plan)
 
   // skip assembly if no onComplete or onChunk, but wait for reading to finish

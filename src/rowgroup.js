@@ -6,7 +6,7 @@ import { assembleNested } from './assemble.js'
 import { readColumn, readColumnPages } from './column.js'
 import { DEFAULT_PARSERS } from './convert.js'
 import { readOffsetIndex } from './indexes.js'
-import { getSchemaPath } from './schema.js'
+import { getMaxRepetitionLevel, getSchemaPath } from './schema.js'
 import { flatten } from './utils.js'
 
 /**
@@ -65,28 +65,37 @@ export function readRowGroup(options, { metadata }, groupPlan) {
 }
 
 /**
- * Read complete physical leaf chunks for a column view. The view indexes
+ * Read physical leaf pages for a column view. The view indexes
  * Dremel row boundaries before materializing any nested JavaScript values.
  *
  * @param {ParquetReadOptions} options
  * @param {QueryPlan} plan
  * @param {GroupPlan} groupPlan
- * @returns {{pathInSchema: string[], schemaPath: SchemaTree[], pages: Promise<import('../src/types.js').ColumnLevelPage[]>}[]}
+ * @returns {{pathInSchema: string[], schemaPath: SchemaTree[], pages: Promise<{pages: import('../src/types.js').ColumnLevelPage[], rowStart: number}>}[]}
  */
 export function readRowGroupPages(options, { metadata }, groupPlan) {
   return groupPlan.chunks.map(chunk => {
-    if ('offsetIndex' in chunk || 'pageLocations' in chunk) {
-      throw new Error('parquet column view requires complete column chunks')
-    }
     const { pathInSchema, schemaPath, columnDecoder } = decoderForChunk(options, metadata, chunk)
     const { startByte, endByte } = chunk.range
+    /** @returns {Promise<{pages: import('../src/types.js').ColumnLevelPage[], rowStart: number}>} */
+    async function selectedPages() {
+      const locations = 'pageLocations' in chunk ? chunk.pageLocations :
+        'offsetIndex' in chunk ? readOffsetIndex({
+          view: new DataView(await options.file.slice(chunk.offsetIndex.startByte, chunk.offsetIndex.endByte)),
+          offset: 0,
+        }).page_locations : undefined
+      if (locations) {
+        const repeated = getMaxRepetitionLevel(schemaPath) > 0
+        const { view, skipped } = await fetchSelectedPages(options, groupPlan, chunk, locations, repeated)
+        return { pages: readColumnPages({ view, offset: 0 }, columnDecoder), rowStart: groupPlan.groupStart + skipped }
+      }
+      const view = new DataView(await options.file.slice(startByte, endByte))
+      return { pages: readColumnPages({ view, offset: 0 }, columnDecoder), rowStart: groupPlan.groupStart }
+    }
     return {
       pathInSchema,
       schemaPath,
-      pages: Promise.resolve(options.file.slice(startByte, endByte)).then(buffer => {
-        const reader = { view: new DataView(buffer), offset: 0 }
-        return readColumnPages(reader, columnDecoder)
-      }),
+      pages: selectedPages(),
     }
   })
 }
@@ -124,12 +133,39 @@ function decoderForChunk(options, metadata, chunk) {
  * @returns {Promise<{data: DecodedArray[], skipped: number}>}
  */
 async function readSelectedPages(options, groupPlan, chunk, pages, columnDecoder) {
+  const { view, skipped } = await fetchSelectedPages(options, groupPlan, chunk, pages)
+  const reader = { view, offset: 0 }
+  const adjustedGroupPlan = skipped ? {
+    ...groupPlan,
+    groupStart: groupPlan.groupStart + skipped,
+    selectStart: groupPlan.selectStart - skipped,
+    selectEnd: groupPlan.selectEnd - skipped,
+  } : groupPlan
+  const { data, skipped: columnSkipped } = readColumn(reader, adjustedGroupPlan, columnDecoder, options.onPage)
+  return { data, skipped: skipped + columnSkipped }
+}
+
+/**
+ * Fetch a selected run of data pages, including a dictionary page when needed.
+ * For repeated leaves, adjacent pages can share a row. Include the preceding
+ * page and any earlier pages with the same first-row index to retain the
+ * beginning of the selected row.
+ *
+ * @param {ParquetReadOptions} options
+ * @param {GroupPlan} groupPlan
+ * @param {ChunkPlan} chunk
+ * @param {PageLocation[]} pages
+ * @param {boolean} [includeContinuedRow]
+ * @returns {Promise<{view: DataView, skipped: number}>}
+ */
+async function fetchSelectedPages(options, groupPlan, chunk, pages, includeContinuedRow = false) {
   const { data_page_offset, dictionary_page_offset } = chunk.columnMetadata
   const { selectStart, selectEnd } = groupPlan
   let { startByte, endByte } = chunk.range
   let skipped = -1
+  let firstPage = -1
   // include dictionary if present, handle polars missing dictionary_page_offset
-  const hasDict = dictionary_page_offset || data_page_offset < pages[0].offset
+  const hasDict = pages.length > 0 && (dictionary_page_offset || data_page_offset < pages[0].offset)
   for (let i = 0; i < pages.length; i++) {
     const page = pages[i]
     const pageStart = Number(page.first_row_index)
@@ -140,12 +176,21 @@ async function readSelectedPages(options, groupPlan, chunk, pages, columnDecoder
     if (skipped < 0 && pageEnd > selectStart) {
       startByte = Number(page.offset)
       skipped = pageStart
+      firstPage = i
     }
     if (pageStart < selectEnd) {
       endByte = Number(page.offset) + page.compressed_page_size
     }
   }
   if (skipped < 0) skipped = 0
+  if (includeContinuedRow && firstPage > 0) {
+    while (firstPage > 0 && Number(pages[firstPage - 1].first_row_index) === skipped) {
+      firstPage--
+    }
+    if (firstPage > 0) firstPage--
+    startByte = Number(pages[firstPage].offset)
+    skipped = Number(pages[firstPage].first_row_index)
+  }
   /** @type {DataView} */
   let view
   if (hasDict && skipped) {
@@ -167,19 +212,7 @@ async function readSelectedPages(options, groupPlan, chunk, pages, columnDecoder
   } else {
     view = new DataView(await options.file.slice(startByte, endByte))
   }
-  const reader = { view, offset: 0 }
-  // adjust row selection for skipped pages
-  const adjustedGroupPlan = skipped ? {
-    ...groupPlan,
-    groupStart: groupPlan.groupStart + skipped,
-    selectStart: groupPlan.selectStart - skipped,
-    selectEnd: groupPlan.selectEnd - skipped,
-  } : groupPlan
-  const { data, skipped: columnSkipped } = readColumn(reader, adjustedGroupPlan, columnDecoder, options.onPage)
-  return {
-    data,
-    skipped: skipped + columnSkipped,
-  }
+  return { view, skipped }
 }
 
 /**

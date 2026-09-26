@@ -39,6 +39,9 @@ export interface BaseParquetReadOptions {
   rowEnd?: number // last requested row index (exclusive)
   onChunk?: (chunk: ColumnData) => void // called when a column chunk is parsed. chunks may contain data outside the requested range.
   onPage?: (chunk: SubColumnData) => void // called when a data page is parsed. pages may contain data outside the requested range.
+  onColumnView?: (result: { columnName: string, view: ParquetColumnView }) => void // one view per selected column and planned row range; defaults to using offset indexes
+  pageRangesByGroup?: (PageRanges | undefined)[] // candidate row ranges per row group, relative to each group
+  pageLocationsByGroup?: Record<string, PageLocation[]>[] // offset-index locations keyed by physical leaf path
   compressors?: Compressors // custom decompressors
   utf8?: boolean // decode byte arrays as utf8 strings (default true)
   parsers?: Partial<ParquetParsers> // custom parsers to decode advanced types, merged over the defaults
@@ -62,7 +65,7 @@ interface ObjectRowFormat {
 export type ParquetReadOptions = BaseParquetReadOptions & (ArrayRowFormat | ObjectRowFormat)
 
 /** Options for a lazy, column-oriented parquet scan. */
-export type ParquetScanOptions = Omit<BaseParquetReadOptions, 'filter' | 'onChunk' | 'onPage' | 'useOffsetIndex' | 'includeRowIndex'> & {
+export type ParquetScanOptions = Omit<BaseParquetReadOptions, 'filter' | 'onChunk' | 'onPage' | 'onColumnView' | 'useOffsetIndex' | 'includeRowIndex'> & {
   /** Conservative filter used only to prune physical row ranges. */
   pruningFilter?: ParquetQueryFilter
   /** Use offset indexes for range reads when available (default true). */
@@ -85,7 +88,7 @@ export interface ParquetScan {
   metadata: FileMetaData
   ranges: readonly ParquetRowRange[]
   readColumn(options: ParquetScanColumnOptions): Promise<DecodedArray>
-  /** Read a column without assembling nested rows. The current implementation reads its complete row-group chunk. */
+  /** Read a column without assembling nested rows, using selected pages when an offset index is available. */
   readColumnView(options: ParquetScanColumnOptions): Promise<ParquetColumnView>
 }
 
@@ -100,6 +103,8 @@ export interface ColumnLevelPage {
 export interface ParquetColumnLeaf {
   pathInSchema: string[]
   schemaPath: SchemaTree[]
+  /** Absolute first row covered by these pages. */
+  rowStart: number
   pages: readonly (ColumnLevelPage & { eventStart: number, eventEnd: number, valueStart: number })[]
   rowOffsets: Uint32Array
   valueOffsets: Uint32Array
@@ -107,7 +112,7 @@ export interface ParquetColumnLeaf {
 
 /** A column whose nested JavaScript values are created only on request. */
 export interface ParquetColumnView {
-  /** Absolute first row of the row group backing the leaf offsets. */
+  /** Absolute first row of the row group; each leaf may start at a later page boundary. */
   groupStart: number
   rowStart: number
   rowEnd: number
